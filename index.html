@@ -479,321 +479,17 @@
 
   <div id="toast" role="status" aria-live="polite">Copied!</div>
 
-<script>
+<script type="module">
+import {
+  LM, AZ_ALPHABET, LABELS, labelMeta,
+  LandmarkSmoother, MotionBuffer,
+  setAzslModel, getAzslModel,
+  LandmarkBuffer, computeTrajectoryFeatures, DynamicHysteresis,
+  predictGesture,
+} from './js/gestures.js';
+
 (function(){
   "use strict";
-
-  // ==========================================================================
-  // PURE GESTURE ENGINE — no DOM access, cannot throw due to missing elements,
-  // safe to define unconditionally at parse time.
-  // ==========================================================================
-  const LM = {
-    WRIST: 0,
-    THUMB_MCP: 2, THUMB_IP: 3, THUMB_TIP: 4,
-    INDEX_MCP: 5, INDEX_PIP: 6, INDEX_TIP: 8,
-    MIDDLE_MCP: 9, MIDDLE_PIP: 10, MIDDLE_TIP: 12,
-    RING_MCP: 13, RING_PIP: 14, RING_TIP: 16,
-    PINKY_MCP: 17, PINKY_PIP: 18, PINKY_TIP: 20,
-  };
-
-  // Per-finger (base, j1, j2, tip) landmark quadruples — thumb, index, middle,
-  // ring, pinky, in this fixed order. Must match FINGERS in
-  // scripts/extract_azsl_model.py exactly so the 15 joint-angle features line
-  // up between the trained model and live inference.
-  const FINGERS = [
-    { base: LM.WRIST, j1: LM.THUMB_MCP, j2: LM.THUMB_IP, tip: LM.THUMB_TIP },
-    { base: LM.WRIST, j1: LM.INDEX_MCP, j2: LM.INDEX_PIP, tip: LM.INDEX_TIP },
-    { base: LM.WRIST, j1: LM.MIDDLE_MCP, j2: LM.MIDDLE_PIP, tip: LM.MIDDLE_TIP },
-    { base: LM.WRIST, j1: LM.RING_MCP, j2: LM.RING_PIP, tip: LM.RING_TIP },
-    { base: LM.WRIST, j1: LM.PINKY_MCP, j2: LM.PINKY_PIP, tip: LM.PINKY_TIP },
-  ];
-  const TIP_PAIRS = [
-    [LM.THUMB_TIP, LM.INDEX_TIP], [LM.INDEX_TIP, LM.MIDDLE_TIP],
-    [LM.MIDDLE_TIP, LM.RING_TIP], [LM.RING_TIP, LM.PINKY_TIP],
-  ];
-
-  // Canonical Azerbaijani Latin alphabet (32 letters) — same order used by
-  // scripts/extract_azsl_model.py and the alphabet reference drawer.
-  const AZ_ALPHABET = [
-    'A', 'B', 'C', 'Ç', 'D', 'E', 'Ə', 'F', 'G', 'Ğ', 'H', 'X', 'I', 'İ',
-    'J', 'K', 'Q', 'L', 'M', 'N', 'O', 'Ö', 'P', 'R', 'S', 'Ş', 'T', 'U',
-    'Ü', 'V', 'Y', 'Z',
-  ];
-
-  const LABELS = { SPACE: 'SPACE', DEL: 'DEL' };
-
-  const CONTROL_LABEL_META = {
-    SPACE: { friendly: 'SPACE',  symbol: '␣' },
-    DEL:   { friendly: 'DELETE', symbol: '⌫' },
-  };
-
-  function labelMeta(label) {
-    return CONTROL_LABEL_META[label] || { friendly: label, symbol: label };
-  }
-
-  const MIN_CONFIDENCE = 0.55;
-  const HEURISTIC_CONF = 0.92;
-  const ANGLE_STRAIGHT = 155; // finger joint angle (deg) considered "extended"
-  const ANGLE_FIST = 100;     // finger joint angle (deg) considered "curled"
-
-  function vecSub(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
-  function vecMag(v) { return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
-  function vecDist(a, b) { return vecMag(vecSub(a, b)); }
-
-  function angleBetween(v1, v2) {
-    const mags = vecMag(v1) * vecMag(v2) || 1e-6;
-    const cos = Math.min(1, Math.max(-1, (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z) / mags));
-    return Math.acos(cos) * (180 / Math.PI);
-  }
-
-  function jointAngleDeg(coords, mcpIdx, pipIdx, tipIdx) {
-    const toMcp = vecSub(coords[mcpIdx], coords[pipIdx]);
-    const toTip = vecSub(coords[tipIdx], coords[pipIdx]);
-    return angleBetween(toMcp, toTip);
-  }
-
-  // Wrist-origin, scale-normalized, then mirrored to a canonical "Right hand"
-  // orientation for left-hand detections — must match normalize_landmarks()
-  // in scripts/extract_azsl_model.py exactly (same order of operations).
-  function normalizeLandmarks(landmarks, mirrorX) {
-    const wrist = landmarks[LM.WRIST];
-    const shifted = landmarks.map((p) => vecSub(p, wrist));
-    let scale = vecMag(shifted[LM.MIDDLE_MCP]);
-    if (scale < 1e-6) scale = 1e-6;
-    const normalized = shifted.map((p) => ({ x: p.x / scale, y: p.y / scale, z: p.z / scale }));
-    if (mirrorX) normalized.forEach((p) => { p.x = -p.x; });
-    return normalized;
-  }
-
-  function LandmarkSmoother(alpha) {
-    this.alpha = alpha || 0.4;
-    this.smoothed = null;
-  }
-  LandmarkSmoother.prototype.reset = function () { this.smoothed = null; };
-  LandmarkSmoother.prototype.update = function (landmarks) {
-    if (!this.smoothed) {
-      this.smoothed = landmarks.map((p) => ({ x: p.x, y: p.y, z: p.z }));
-      return this.smoothed;
-    }
-    const a = this.alpha;
-    this.smoothed = landmarks.map((p, i) => ({
-      x: a * p.x + (1 - a) * this.smoothed[i].x,
-      y: a * p.y + (1 - a) * this.smoothed[i].y,
-      z: a * p.z + (1 - a) * this.smoothed[i].z,
-    }));
-    return this.smoothed;
-  };
-
-  // 10-frame sliding ring buffer over RAW (pre-normalization) wrist position,
-  // used to estimate motion for the dynamic letters (Ç,D,G,K,Ö,Ü,Y,Z were the
-  // ones with genuine multi-frame burst data during training — see
-  // scripts/extract_azsl_model.py). Velocity is expressed as "position change
-  // per processed frame" to match how training-time velocity was computed
-  // (position delta / frame-number gap) — see that script's docstring for why
-  // frame-index units, not wall-clock seconds, are used on both sides.
-  function MotionBuffer(size) {
-    this.size = size || 10;
-    this.buffer = [];
-  }
-  MotionBuffer.prototype.reset = function () { this.buffer = []; };
-  MotionBuffer.prototype.velocityAndPush = function (x, y) {
-    let vx = 0, vy = 0;
-    if (this.buffer.length) {
-      const oldest = this.buffer[0];
-      const span = this.buffer.length;
-      vx = (x - oldest.x) / span;
-      vy = (y - oldest.y) / span;
-    }
-    this.buffer.push({ x: x, y: y });
-    if (this.buffer.length > this.size) this.buffer.shift();
-    return { x: vx, y: vy };
-  };
-
-  function fingerState(coords, mcpIdx, pipIdx, tipIdx) {
-    const angle = jointAngleDeg(coords, mcpIdx, pipIdx, tipIdx);
-    if (angle >= ANGLE_STRAIGHT) return 'extended';
-    if (angle <= ANGLE_FIST) return 'curled';
-    return 'mid';
-  }
-
-  function thumbExtended(coords, margin) {
-    margin = margin || 1.15;
-    const tipToPinky = vecDist(coords[LM.THUMB_TIP], coords[LM.PINKY_MCP]);
-    const mcpToPinky = vecDist(coords[LM.THUMB_MCP], coords[LM.PINKY_MCP]);
-    return tipToPinky > mcpToPinky * margin;
-  }
-
-  function thumbPointingUp(coords, threshold) {
-    threshold = threshold || 0.15;
-    return coords[LM.THUMB_TIP].y < coords[LM.THUMB_MCP].y - threshold &&
-           coords[LM.THUMB_TIP].y < -threshold;
-  }
-
-  function gestureResult(label) { return { label: label, confidence: HEURISTIC_CONF }; }
-
-  // The dataset only contains the 32 alphabet letters — there is no trained
-  // gesture for SPACE/DEL, so those two stay simple geometric heuristics
-  // layered on top of the trained hierarchical letter classifier below. Both
-  // checks are built from distances/angles, which are mirror-invariant, so
-  // they need no handedness correction.
-  function detectControlGesture(coords) {
-    const fs = {
-      index: fingerState(coords, LM.INDEX_MCP, LM.INDEX_PIP, LM.INDEX_TIP),
-      middle: fingerState(coords, LM.MIDDLE_MCP, LM.MIDDLE_PIP, LM.MIDDLE_TIP),
-      ring: fingerState(coords, LM.RING_MCP, LM.RING_PIP, LM.RING_TIP),
-      pinky: fingerState(coords, LM.PINKY_MCP, LM.PINKY_PIP, LM.PINKY_TIP),
-    };
-    const thumbOut = thumbExtended(coords);
-    const thumbUp = thumbPointingUp(coords);
-    const allCurled = fs.index === 'curled' && fs.middle === 'curled' && fs.ring === 'curled' && fs.pinky === 'curled';
-
-    if (thumbOut && thumbUp && allCurled) return gestureResult(LABELS.SPACE);
-
-    // The angle-based "curled" check alone false-fires on some open-palm 'B'
-    // shapes (real dataset variation, discovered via scripts validation —
-    // moderately bent fingers at some capture angles still read as
-    // "curled"). Require the index tip to be CLEARLY the farthest fingertip
-    // from the wrist, which a genuine one-finger point has and an open palm
-    // does not, as a second independent confirmation.
-    const indexDist = vecMag(coords[LM.INDEX_TIP]);
-    const indexClearlyFarthest =
-      indexDist > vecMag(coords[LM.MIDDLE_TIP]) * 1.2 &&
-      indexDist > vecMag(coords[LM.RING_TIP]) * 1.3 &&
-      indexDist > vecMag(coords[LM.PINKY_TIP]) * 1.4;
-
-    if (!thumbOut && fs.index === 'extended' && fs.middle === 'curled' &&
-        fs.ring === 'curled' && fs.pinky === 'curled' && indexClearlyFarthest) {
-      return gestureResult(LABELS.DEL);
-    }
-    return null;
-  }
-
-  // ------------------------------------------------------------------ //
-  // Two-level hierarchical classifier against models/azsl_hierarchical_model.json
-  // (Level 1: 6-way confusion-cluster dispatcher MLP. Level 2: one
-  // specialized MLP per cluster — see scripts/extract_azsl_model.py for how
-  // these were trained and exported; the JS below just replays their forward
-  // pass, since no ML library is loaded in the browser).
-  // ------------------------------------------------------------------ //
-  let AZSL_MODEL = null;
-
-  function jointAngles15(coords) {
-    const out = new Array(15);
-    const middleDir = vecSub(coords[LM.MIDDLE_PIP], coords[LM.MIDDLE_MCP]);
-    for (let i = 0; i < FINGERS.length; i++) {
-      const f = FINGERS[i];
-      const baseFlex = angleBetween(vecSub(coords[f.base], coords[f.j1]), vecSub(coords[f.j2], coords[f.j1]));
-      const tipFlex = angleBetween(vecSub(coords[f.j1], coords[f.j2]), vecSub(coords[f.tip], coords[f.j2]));
-      const thisDir = vecSub(coords[f.j2], coords[f.j1]);
-      const spread = angleBetween(thisDir, middleDir);
-      out[i * 3] = baseFlex; out[i * 3 + 1] = tipFlex; out[i * 3 + 2] = spread;
-    }
-    return out;
-  }
-
-  function tipDistances4(coords) {
-    return TIP_PAIRS.map((pair) => vecDist(coords[pair[0]], coords[pair[1]]));
-  }
-
-  // 84-dim: [63 normalized coords][15 joint angles][4 tip distances][2 velocity].
-  // Must match build_feature_vector() in scripts/extract_azsl_model.py exactly.
-  function buildFeatureVector84(coords, velocity) {
-    const out = new Array(84);
-    let k = 0;
-    for (let i = 0; i < coords.length; i++) { out[k++] = coords[i].x; out[k++] = coords[i].y; out[k++] = coords[i].z; }
-    const angles = jointAngles15(coords);
-    for (let i = 0; i < angles.length; i++) out[k++] = angles[i];
-    const dists = tipDistances4(coords);
-    for (let i = 0; i < dists.length; i++) out[k++] = dists[i];
-    out[k++] = velocity.x; out[k++] = velocity.y;
-    return out;
-  }
-
-  function applyScaler(vec, scaler) {
-    const out = new Array(vec.length);
-    for (let i = 0; i < vec.length; i++) {
-      const std = scaler.std[i] > 1e-9 ? scaler.std[i] : 1e-9;
-      out[i] = (vec[i] - scaler.mean[i]) / std;
-    }
-    return out;
-  }
-
-  // Replays a trained sklearn MLPClassifier: dense layers with ReLU hidden
-  // activation, softmax (multi-class) or sigmoid (sklearn's collapsed binary
-  // case, re-expanded here into two explicit class probabilities) output.
-  // Returns candidates sorted by confidence, highest first.
-  function mlpForward(model, inputVec) {
-    let activation = inputVec;
-    for (let li = 0; li < model.layers.length; li++) {
-      const layer = model.layers[li];
-      const isOutputLayer = li === model.layers.length - 1;
-      const out = new Array(layer.biases.length);
-      for (let j = 0; j < layer.biases.length; j++) {
-        let sum = layer.biases[j];
-        for (let i = 0; i < activation.length; i++) sum += activation[i] * layer.weights[i][j];
-        out[j] = sum;
-      }
-      if (!isOutputLayer) {
-        for (let j = 0; j < out.length; j++) out[j] = Math.max(0, out[j]); // ReLU
-      }
-      activation = out;
-    }
-
-    let candidates;
-    if (model.outputActivation === 'sigmoid_binary') {
-      const p1 = 1 / (1 + Math.exp(-activation[0]));
-      candidates = [
-        { label: model.classes[0], confidence: 1 - p1 },
-        { label: model.classes[1], confidence: p1 },
-      ];
-    } else {
-      const maxLogit = Math.max.apply(null, activation);
-      const exps = activation.map((v) => Math.exp(v - maxLogit));
-      const sumExp = exps.reduce((a, b) => a + b, 0) || 1e-9;
-      candidates = model.classes.map((label, i) => ({ label: label, confidence: exps[i] / sumExp }));
-    }
-    candidates.sort((a, b) => b.confidence - a.confidence);
-    return candidates;
-  }
-
-  function classifyHierarchical(coords, velocity) {
-    if (!AZSL_MODEL) return { label: null, confidence: 0, candidates: [] };
-
-    const full84 = buildFeatureVector84(coords, velocity);
-    const clusterCandidates = mlpForward(AZSL_MODEL.level1.model, applyScaler(full84, AZSL_MODEL.level1.scaler));
-    const clusterEntry = AZSL_MODEL.clusters[String(clusterCandidates[0].label)];
-    if (!clusterEntry) return { label: null, confidence: 0, candidates: [] };
-
-    const subInput = clusterEntry.featureIndices.length === full84.length
-      ? full84
-      : clusterEntry.featureIndices.map((idx) => full84[idx]);
-    const letterCandidates = mlpForward(clusterEntry.model, applyScaler(subInput, clusterEntry.scaler));
-
-    return { label: letterCandidates[0].label, confidence: letterCandidates[0].confidence, candidates: letterCandidates.slice(0, 2) };
-  }
-
-  // SPACE/DEL have no trained representation (dataset = 32 letters only) and
-  // their handshapes were borrowed from English ASL with no linguistic
-  // connection to AzSL — testing against real dataset images showed AzSL's
-  // actual "B" naturally has index/other-finger proportions that can trigger
-  // the "index-only-extended" DEL heuristic. So the trained classifier goes
-  // FIRST: only fall back to the geometric heuristic when the trained model
-  // itself isn't confident about any letter — data wins over guesswork.
-  const CONTROL_OVERRIDE_CONFIDENCE = 0.75;
-
-  function predictGesture(landmarksArray, mirrorX, velocity) {
-    const coords = normalizeLandmarks(landmarksArray, mirrorX);
-    const v = mirrorX ? { x: -velocity.x, y: velocity.y } : velocity;
-    const letterResult = classifyHierarchical(coords, v);
-
-    if (letterResult.confidence >= CONTROL_OVERRIDE_CONFIDENCE) return letterResult;
-
-    const control = detectControlGesture(coords);
-    if (control) return { label: control.label, confidence: control.confidence, candidates: [control] };
-
-    if (letterResult.confidence >= MIN_CONFIDENCE) return letterResult;
-    return { label: null, confidence: letterResult.confidence, candidates: [] };
-  }
 
   // ==========================================================================
   // APP BOOTSTRAP — everything DOM-related lives here, wired the instant the
@@ -871,6 +567,14 @@
     };
     const smoother = new LandmarkSmoother(EMA_ALPHA);
     const motionBuffer = new MotionBuffer(10);
+    // Temporal trajectory engine (js/gestures.js) — separate from
+    // motionBuffer above, which only feeds the trained model's own 2-dim
+    // velocity feature. landmarkBuffer tracks a richer multi-landmark
+    // window used purely for post-classification rescoring of dynamic
+    // letters (Ö/Ü/Ç/Z/D/K/İ/G/Y); dynamicHysteresis debounces the
+    // static<->dynamic relabel it can trigger.
+    const landmarkBuffer = new LandmarkBuffer(14);
+    const dynamicHysteresis = new DynamicHysteresis();
     let sentence = '';
     let currentWord = '';
 
@@ -1274,9 +978,10 @@
     // ------------------------------------------------------------------ //
     function trainedLetterSet() {
       const set = {};
-      if (AZSL_MODEL) {
-        for (const cid in AZSL_MODEL.clusters) {
-          AZSL_MODEL.clusters[cid].letters.forEach(function (l) { set[l] = true; });
+      const model = getAzslModel();
+      if (model) {
+        for (const cid in model.clusters) {
+          model.clusters[cid].letters.forEach(function (l) { set[l] = true; });
         }
       }
       return set;
@@ -1294,7 +999,7 @@
         );
       }).join('');
 
-      if (!AZSL_MODEL) {
+      if (!getAzslModel()) {
         alphabetSubtitle.textContent = 'Loading model coverage…';
       } else {
         const count = Object.keys(trainedSet).length;
@@ -1322,7 +1027,7 @@
           return res.json();
         })
         .then(function (data) {
-          AZSL_MODEL = data; // already in the exact shape classifyHierarchical() expects
+          setAzslModel(data); // already in the exact shape classifyHierarchical() expects
           const count = Object.keys(trainedLetterSet()).length;
           const e2e = data.crossValidation && data.crossValidation.endToEnd;
           const cvText = e2e ? ', 5-fold end-to-end CV ' + Math.round(e2e.mean * 100) + '%' : '';
@@ -1671,11 +1376,16 @@
                 // Velocity comes from the RAW (pre-smoothing) wrist position,
                 // matching how training-time velocity was measured.
                 const velocity = motionBuffer.velocityAndPush(rawLandmarks[LM.WRIST].x, rawLandmarks[LM.WRIST].y);
-                const prediction = predictGesture(smoothed, mirrorX, velocity);
+                const now = performance.now();
+                landmarkBuffer.push(rawLandmarks, now);
+                const trajectory = computeTrajectoryFeatures(landmarkBuffer, mirrorX);
+                const prediction = predictGesture(smoothed, mirrorX, velocity, trajectory, dynamicHysteresis, now);
                 ingestPrediction(prediction.label, prediction.confidence, prediction.candidates);
               } else {
                 smoother.reset();
                 motionBuffer.reset();
+                landmarkBuffer.reset();
+                dynamicHysteresis.reset();
                 clearSkeleton();
                 ingestPrediction(null, 0);
               }
