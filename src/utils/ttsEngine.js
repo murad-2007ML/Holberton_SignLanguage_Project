@@ -2,23 +2,31 @@
 // SignLanguageTTS — gesture-stream buffering + 3-tier Azerbaijani
 // text-to-speech for the AzSL translator.
 //
-// Engine hierarchy (each tier is only attempted if the one above it throws):
-//   1. Azure Cognitive Services Speech SDK (az-AZ-BanuNeural / BabekNeural)
-//      — best quality, requires azureKey/azureRegion.
-//   2. Native window.speechSynthesis, but ONLY if the browser actually
-//      exposes a voice whose .lang matches /^az/i. Most Windows/Chrome
-//      installs have NO Azerbaijani voice pack, and speechSynthesis will
-//      silently substitute the system default (en-US) instead of erroring
-//      if you ask for one anyway — so this tier must verify a real az
-//      voice exists and skip itself entirely rather than ever calling
-//      .speak() with a mismatched voice (the actual root cause of AzSL
-//      text being read with an English accent).
-//   3. Google Translate's public translate_tts endpoint, played back
-//      directly via an <audio src="..."> element — the zero-config, free
-//      fallback that actually produces correct Azerbaijani pronunciation
-//      for the common case (no Azure subscription, no OS az voice pack).
-//      config.gttsEndpoint can override this with a custom REST endpoint
-//      (string URL or (text, voice) => URL) that returns raw audio bytes.
+// Engine hierarchy (each tier is only attempted if the one above it throws).
+// EVERY tier speaks Azerbaijani (az-AZ) or it doesn't speak at all — there
+// is intentionally no "generic"/default-locale fallback anywhere in this
+// file. If tiers 1-3 all fail, _synthesize() logs an explicit error and
+// stays silent rather than letting the browser or an engine substitute
+// English, Turkish, or any other language.
+//   1. Azure Cognitive Services Speech SDK, pinned to az-AZ-BanuNeural or
+//      az-AZ-BabekNeural (see ALLOWED_AZURE_VOICES — setVoice() rejects
+//      anything else). Requires azureKey/azureRegion (config, or the
+//      VITE_AZURE_SPEECH_KEY / VITE_AZURE_SPEECH_REGION env vars).
+//   2. A free, keyless audio stream, always requesting Azerbaijani
+//      explicitly: Google Translate's public translate_tts endpoint with
+//      tl=az (hardcoded, never derived from user input), played back via
+//      an <audio src="..."> element. config.gttsEndpoint can override this
+//      with a custom REST endpoint (string URL or (text, voice) => URL) —
+//      e.g. a self-hosted Edge-TTS proxy — as long as it returns az-AZ
+//      audio bytes; this module cannot inspect opaque audio to verify that.
+//   3. Native window.speechSynthesis, but ONLY if the browser actually
+//      exposes a voice whose .lang starts with "az" (case-insensitive).
+//      Most Windows/Chrome installs have NO Azerbaijani voice pack, and
+//      speechSynthesis will silently substitute the system default
+//      (en-US) instead of erroring if you ask for one anyway — so this
+//      tier must verify a real az voice exists and skip itself entirely
+//      rather than ever calling .speak() with a mismatched voice (the
+//      actual root cause of AzSL text being read with an English accent).
 //
 // This module owns its own gesture buffer: the ML pipeline fires a raw
 // prediction on every processed frame ('S','S','A','L','A','M', ...), so
@@ -38,6 +46,23 @@ export const VOICES = {
   banu: 'az-AZ-BanuNeural',
   babek: 'az-AZ-BabekNeural',
 };
+
+// Only these two are ever accepted as the Azure voice — never validated
+// against a pattern, because a pattern like /^az-AZ/ would happily accept
+// a future non-Azerbaijani voice Microsoft ships under a similar-looking
+// name. An explicit allowlist is the only way to actually guarantee this.
+const ALLOWED_AZURE_VOICES = new Set(Object.values(VOICES));
+
+function resolveVoiceName(candidate, fallback) {
+  if (typeof candidate === 'string' && ALLOWED_AZURE_VOICES.has(candidate)) return candidate;
+  if (candidate != null) {
+    console.error(
+      `[SignLanguageTTS] Rejected voice "${candidate}" — only ${[...ALLOWED_AZURE_VOICES].join(', ')} ` +
+      `are allowed, to guarantee Azerbaijani-only output. Staying on "${fallback}".`
+    );
+  }
+  return fallback;
+}
 
 function clampRate(value) {
   const n = Number(value);
@@ -82,16 +107,18 @@ function buildSsml(text, voiceName, rate) {
 export class SignLanguageTTS {
   constructor(config = {}) {
     this.config = {
-      azureKey: config.azureKey || null,
-      azureRegion: config.azureRegion || null,
-      gttsEndpoint: config.gttsEndpoint || null, // optional override; default is Google Translate TTS (tier 3)
+      // import.meta.env is Vite-injected; falls back to config for callers
+      // that already have the key/region from elsewhere (e.g. a server).
+      azureKey: config.azureKey || import.meta.env?.VITE_AZURE_SPEECH_KEY || null,
+      azureRegion: config.azureRegion || import.meta.env?.VITE_AZURE_SPEECH_REGION || null,
+      gttsEndpoint: config.gttsEndpoint || null, // optional override; default is Google Translate TTS (tier 2)
       dedupeWindowMs: config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS,
       idleFlushMs: config.idleFlushMs ?? DEFAULT_IDLE_FLUSH_MS,
       spaceToken: config.spaceToken || 'SPACE',
       deleteToken: config.deleteToken || 'DEL',
     };
 
-    this.voiceName = config.voice || VOICES.banu;
+    this.voiceName = resolveVoiceName(config.voice, VOICES.banu);
     this.rate = clampRate(config.rate ?? 1.0);
 
     this.buffer = '';
@@ -286,9 +313,8 @@ export class SignLanguageTTS {
   setRate(speed) { this.rate = clampRate(speed); }
 
   setVoice(voiceName) {
-    if (typeof voiceName !== 'string' || !voiceName) return;
-    this.voiceName = voiceName;
-    if (this._azure?.speechConfig) this._azure.speechConfig.speechSynthesisVoiceName = voiceName;
+    this.voiceName = resolveVoiceName(voiceName, this.voiceName);
+    if (this._azure?.speechConfig) this._azure.speechConfig.speechSynthesisVoiceName = this.voiceName;
   }
 
   // Tears down any in-flight audio/synthesizer state and detaches all
@@ -322,8 +348,8 @@ export class SignLanguageTTS {
 
     const tiers = [
       { id: 1, run: () => this._speakAzure(text, seq) },
-      { id: 2, run: () => this._speakBrowser(text, seq) },
-      { id: 3, run: () => this._speakGoogleTranslate(text, seq) },
+      { id: 2, run: () => this._speakGoogleTranslate(text, seq) },
+      { id: 3, run: () => this._speakBrowser(text, seq) },
     ];
 
     let lastError = null;
@@ -338,8 +364,14 @@ export class SignLanguageTTS {
       }
     }
 
+    // STRICT: every tier above only ever speaks az-AZ or throws — there is
+    // no tier left that could speak another language, so the only correct
+    // move here is to log loudly and stay silent, never substitute English/
+    // Turkish/anything else.
+    const message = 'All Azerbaijani (az-AZ) speech engines failed — refusing to fall back to another language.';
+    console.error(`[SignLanguageTTS] ${message}`, lastError);
     this._signalSpeakingEnd(seq);
-    this._emit('error', { tier: 'all', message: 'All TTS engines failed', error: lastError });
+    this._emit('error', { tier: 'all', message, error: lastError });
   }
 
   // Called by whichever tier actually starts producing audible audio.
@@ -434,66 +466,11 @@ export class SignLanguageTTS {
     });
   }
 
-  // ---- Tier 2: native browser speechSynthesis, az-AZ voice only ----
-  _getBrowserVoiceList() {
-    return new Promise((resolve) => {
-      if (typeof window === 'undefined' || !window.speechSynthesis) return resolve([]);
-      const existing = window.speechSynthesis.getVoices();
-      if (existing.length) return resolve(existing);
-      const handler = () => {
-        window.speechSynthesis.removeEventListener('voiceschanged', handler);
-        resolve(window.speechSynthesis.getVoices());
-      };
-      window.speechSynthesis.addEventListener('voiceschanged', handler);
-      // Some browsers never fire voiceschanged for an empty voice list.
-      setTimeout(() => {
-        window.speechSynthesis.removeEventListener('voiceschanged', handler);
-        resolve(window.speechSynthesis.getVoices());
-      }, 500);
-    });
-  }
-
-  // Strict check, on purpose: /^az/i matches "az", "az-AZ", "az-Latn", etc.
-  // If nothing in the installed voice list matches, this returns null and
-  // _speakBrowser below skips speechSynthesis.speak() entirely — it must
-  // NEVER be called with text.lang='az-AZ' and no matching voice, since
-  // browsers silently substitute the system default voice (typically
-  // en-US) in that case instead of failing, which is exactly what makes
-  // Azerbaijani text come out with an English accent.
-  async _findAzBrowserVoice() {
-    if (this._browserVoice !== undefined) return this._browserVoice;
-    const voices = await this._getBrowserVoiceList();
-    this._browserVoice = voices.find((v) => v.lang && /^az/i.test(v.lang)) || null;
-    return this._browserVoice;
-  }
-
-  async _speakBrowser(text, seq) {
-    if (typeof window === 'undefined' || !window.speechSynthesis) throw new Error('speechSynthesis-unavailable');
-    const azVoice = await this._findAzBrowserVoice();
-    if (!azVoice) throw new Error('no-az-browser-voice'); // CRITICAL: never fall through to speak() without one
-
-    return new Promise((resolve, reject) => {
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.voice = azVoice;
-      utterance.lang = azVoice.lang;
-      utterance.rate = this.rate;
-      this._activeSettle = () => resolve();
-      utterance.onstart = () => this._markSpeakingStarted(text, seq);
-      utterance.onend = () => { this._activeSettle = null; resolve(); };
-      utterance.onerror = (e) => {
-        this._activeSettle = null;
-        reject(e.error instanceof Error ? e.error : new Error('speechSynthesis error'));
-      };
-      this._activeUtterance = utterance;
-      window.speechSynthesis.speak(utterance);
-    });
-  }
-
-  // ---- Tier 3: free audio stream fallback ----
+  // ---- Tier 2: free audio stream fallback (always Azerbaijani) ----
   // Dispatches to a caller-supplied REST endpoint if configured, otherwise
-  // defaults to Google Translate's public TTS stream — the "just works,
-  // no API key" fallback that actually speaks Azerbaijani instead of
-  // going silent when tiers 1+2 aren't available.
+  // defaults to Google Translate's public TTS stream with tl=az hardcoded
+  // — the "just works, no API key" fallback that actually speaks
+  // Azerbaijani instead of going silent when tier 1 isn't available.
   async _speakGoogleTranslate(text, seq) {
     if (this.config.gttsEndpoint) return this._speakCustomEndpoint(text, seq);
 
@@ -543,6 +520,63 @@ export class SignLanguageTTS {
         reject(new Error('audio playback failed'));
       };
       audio.play().catch((err) => { this._activeSettle = null; this._releaseAudio(); reject(err); });
+    });
+  }
+
+  // ---- Tier 3: native browser speechSynthesis, STRICT az-AZ voice only ----
+  _getBrowserVoiceList() {
+    return new Promise((resolve) => {
+      if (typeof window === 'undefined' || !window.speechSynthesis) return resolve([]);
+      const existing = window.speechSynthesis.getVoices();
+      if (existing.length) return resolve(existing);
+      const handler = () => {
+        window.speechSynthesis.removeEventListener('voiceschanged', handler);
+        resolve(window.speechSynthesis.getVoices());
+      };
+      window.speechSynthesis.addEventListener('voiceschanged', handler);
+      // Some browsers never fire voiceschanged for an empty voice list.
+      setTimeout(() => {
+        window.speechSynthesis.removeEventListener('voiceschanged', handler);
+        resolve(window.speechSynthesis.getVoices());
+      }, 500);
+    });
+  }
+
+  // Strict check, on purpose: matches voice.lang.startsWith('az') (case-
+  // insensitive, so "AZ-az" style casing quirks some drivers report still
+  // count), i.e. "az", "az-AZ", "az-Latn", etc. — NEVER a looser locale
+  // match. If nothing in the installed voice list matches, this returns
+  // null and _speakBrowser below skips speechSynthesis.speak() entirely —
+  // it must NEVER be called with text.lang='az-AZ' and no matching voice,
+  // since browsers silently substitute the system default voice (typically
+  // en-US) in that case instead of failing, which is exactly what makes
+  // Azerbaijani text come out with an English (or Turkish, etc.) accent.
+  async _findAzBrowserVoice() {
+    if (this._browserVoice !== undefined) return this._browserVoice;
+    const voices = await this._getBrowserVoiceList();
+    this._browserVoice = voices.find((v) => v.lang && /^az/i.test(v.lang)) || null;
+    return this._browserVoice;
+  }
+
+  async _speakBrowser(text, seq) {
+    if (typeof window === 'undefined' || !window.speechSynthesis) throw new Error('speechSynthesis-unavailable');
+    const azVoice = await this._findAzBrowserVoice();
+    if (!azVoice) throw new Error('no-az-browser-voice'); // CRITICAL: never fall through to speak() without one
+
+    return new Promise((resolve, reject) => {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.voice = azVoice;
+      utterance.lang = azVoice.lang;
+      utterance.rate = this.rate;
+      this._activeSettle = () => resolve();
+      utterance.onstart = () => this._markSpeakingStarted(text, seq);
+      utterance.onend = () => { this._activeSettle = null; resolve(); };
+      utterance.onerror = (e) => {
+        this._activeSettle = null;
+        reject(e.error instanceof Error ? e.error : new Error('speechSynthesis error'));
+      };
+      this._activeUtterance = utterance;
+      window.speechSynthesis.speak(utterance);
     });
   }
 }
